@@ -4659,3 +4659,202 @@ The dashboard is production-ready with a sleek, modern design that provides comp
 
 ---
 
+
+Let me help you resolve these issues systematically. Here's what's happening and how to fix it:
+
+### Issue Analysis
+1. **404 for `/api/reports`**  
+   - The endpoint exists but isn't registered (likely missing blueprint registration)
+   - This explains why you're getting a Flask 404 error
+
+2. **Empty results for `/api/drive-health`**  
+   - The date range calculation isn't matching your report timestamps
+   - The container might not have access to your reports directory
+
+### Solution Implementation
+
+1. First, let's fix the missing `/api/reports` endpoint by ensuring proper blueprint registration:
+
+```python:backend/app/__init__.py
+from flask import Flask
+from flask_cors import CORS
+from .config import Config
+import logging
+
+def create_app():
+    app = Flask(__name__)
+    app.config.from_object(Config)
+    CORS(app, origins=["http://localhost"])
+    
+    # Configure logging
+    logging.basicConfig(
+        level=app.config['LOG_LEVEL'],
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger(__name__)
+    
+    # Register blueprints
+    from .routes import bp
+    app.register_blueprint(bp, url_prefix='/api')  # Note the url_prefix
+    
+    logger.info("Flask application initialized")
+    return app
+```
+
+2. Update the routes to ensure proper date handling:
+
+```python:backend/app/routes.py
+from flask import Blueprint, jsonify, request, current_app
+from .utils import process_csv_files, compare_drive_metrics, safe_int
+import logging
+from datetime import datetime, timedelta
+import pytz
+import os
+
+bp = Blueprint('api', __name__)  # No url_prefix here since we added it in create_app
+logger = logging.getLogger(__name__)
+
+@bp.route('/reports', methods=['GET'])  # Note: no /api prefix here
+def get_reports():
+    try:
+        reports_dir = current_app.config['REPORTS_DIR']
+        if not os.path.exists(reports_dir):
+            logger.error(f"Reports directory missing: {reports_dir}")
+            return jsonify({'error': 'Reports directory not found'}), 500
+            
+        files = [f for f in os.listdir(reports_dir) if f.endswith('.csv')]
+        logger.info(f"Found {len(files)} reports in {reports_dir}")
+        return jsonify(files)
+    except Exception as e:
+        logger.error(f"Report listing failed: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Failed to list reports'}), 500
+
+@bp.route('/drive-health', methods=['GET'])
+def get_drive_health():
+    tz = pytz.timezone(current_app.config['TIMEZONE'])
+    now = datetime.now(tz)
+    
+    try:
+        # Handle date parameters
+        start_date = now - timedelta(hours=24)  # Default 24h window
+        end_date = now
+        
+        if 'start' in request.args:
+            try:
+                start_date = datetime.strptime(
+                    request.args['start'], 
+                    '%Y-%m-%dT%H:%M'
+                ).replace(tzinfo=tz)
+            except ValueError:
+                return jsonify({'error': 'Invalid start date format'}), 400
+                
+        if 'end' in request.args:
+            try:
+                end_date = datetime.strptime(
+                    request.args['end'], 
+                    '%Y-%m-%dT%H:%M'
+                ).replace(tzinfo=tz)
+            except ValueError:
+                return jsonify({'error': 'Invalid end date format'}), 400
+
+        # Expand search window to catch daily reports
+        search_start = start_date - timedelta(hours=12)
+        search_end = end_date + timedelta(hours=12)
+        
+        logger.info(f"Processing reports from {search_start} to {search_end}")
+        
+        try:
+            all_reports = process_csv_files(
+                current_app.config['REPORTS_DIR'],
+                search_start,
+                search_end
+            )
+        except Exception as e:
+            logger.error(f"Report processing failed: {str(e)}")
+            return jsonify({'error': 'Report processing error'}), 500
+
+        # Filter to requested time window
+        filtered_reports = [
+            r for r in all_reports
+            if start_date <= r['dateTime'] <= end_date
+        ]
+        
+        if not filtered_reports:
+            return jsonify({
+                "allCurrent": [],
+                "failedCurrent": [],
+                "trendData": []
+            })
+
+        # Rest of your drive-health logic...
+        # (Keep your existing response building code here)
+
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
+```
+
+3. Verify the volume mount is working:
+
+```bash
+# Check if reports are visible in container
+docker exec -it disk-health-prod-4-3 ls -l /app/reports
+
+# Expected output should show your CSV files
+```
+
+### Debugging Steps
+
+1. **Check container logs**:
+```bash
+docker logs disk-health-prod-4-3
+```
+
+2. **Verify file permissions**:
+```bash
+docker exec -it disk-health-prod-4-3 ls -ld /app/reports
+```
+
+3. **Test with explicit dates**:
+```bash
+curl "http://localhost:5043/drive-health?start=2025-06-24T00:00&end=2025-06-25T23:59"
+```
+
+### Common Fixes
+
+1. If you see permission errors, run:
+```bash
+chmod -R a+r $(pwd)/reports
+```
+
+2. If the volume isn't mounting correctly, try:
+```bash
+docker run -d \
+  -p 5043:5000 \
+  -v $(pwd)/reports:/app/reports:ro \
+  -e REPORTS_DIR=/app/reports \
+  -e TIMEZONE=Asia/Kolkata \
+  --name disk-health-prod-4-4 \
+  disk-health-backend-prod-4-3
+```
+
+3. For immediate testing, you can copy files directly:
+```bash
+docker cp $(pwd)/reports/. disk-health-prod-4-3:/app/reports/
+```
+
+### Expected Outcomes
+
+After these changes:
+1. `/api/reports` should return your CSV file list
+2. `/api/drive-health` should return data when:
+   - Reports exist within the 24-hour window
+   - Or when using explicit date parameters
+
+The key improvements are:
+- Proper blueprint registration
+- More robust date handling
+- Better error logging
+- Explicit volume mount verification
+
+------------------------
